@@ -1,0 +1,6 @@
+# web
+arp.interoot.hu:443
+
+# mail
+mx.pymavis.cloud:25
+webmail.interoot.hu:143
