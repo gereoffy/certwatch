@@ -47,6 +47,7 @@ ATTR_USER_NAME = 1
 ATTR_NAS_IP_ADDRESS = 4
 ATTR_SERVICE_TYPE = 6
 ATTR_FRAMED_PROTOCOL = 7
+ATTR_REPLY_MESSAGE = 18
 ATTR_CALLING_STATION_ID = 31
 ATTR_STATE = 24
 ATTR_NAS_IDENTIFIER = 32
@@ -140,6 +141,35 @@ def get_state(attrs: list[tuple[int, bytes]]) -> bytes | None:
     return None
 
 
+def get_reply_messages(attrs: list[tuple[int, bytes]]) -> list[str]:
+    msgs = []
+    for t, v in attrs:
+        if t == ATTR_REPLY_MESSAGE:
+            try:
+                msgs.append(v.decode("utf-8"))
+            except UnicodeDecodeError:
+                msgs.append(v.decode("latin-1", errors="replace"))
+    return msgs
+
+
+def reject_diagnostics(attrs: list[tuple[int, bytes]]) -> str:
+    """Osszegyujti, amit egy Access-Reject csomagbol meg lehet tudni: a
+    szerver altal kuldott Reply-Message szoveget (ha van), es ha meg mindig
+    van benne EAP-Message, annak a nyers hexdump-jat - ez segithet
+    beazonositani, hogy pl. TLS Alert-et kuldott-e a szerver, vagy policy
+    miatt utasitotta el a kerest."""
+    parts = []
+    for msg in get_reply_messages(attrs):
+        parts.append(f"Reply-Message: {msg}")
+    eap_bytes = get_eap_message(attrs)
+    if eap_bytes:
+        preview = eap_bytes[:80].hex(" ")
+        parts.append(f"EAP-Message a reject-ben ({len(eap_bytes)} byte, elso 80: {preview})")
+    if not parts:
+        parts.append("(a szerver nem adott tovabbi indoklast a valaszban)")
+    return " | ".join(parts)
+
+
 # ----------------------------------------------------------------------------
 # EAP reteg (RFC 3748) + EAP-PEAP fragmentacios fejlec (RFC 5216-stilus flags)
 # ----------------------------------------------------------------------------
@@ -163,6 +193,19 @@ SUPPORTED_TLS_TUNNEL_TYPES = {
     EAP_TYPE_TLS: "EAP-TLS",
     EAP_TYPE_TTLS: "EAP-TTLS",
     EAP_TYPE_PEAP: "PEAP",
+}
+
+# Gyakori EAP tipusok, amik NEM alagutazott TLS-t hasznalnak, tehat nincs
+# bennuk kiszolgalo-tanusitvany, amit ki lehetne nyerni. Ha a szerver
+# ilyet valaszol, ertelmesebb hibauzenetet adunk, mint az altalanos
+# "nem tamogatott tipus"-t.
+KNOWN_NON_TLS_EAP_TYPES = {
+    4: "MD5-Challenge (EAP-MD5) - egyszeru challenge/response, nincs TLS/tanusitvany",
+    6: "EAP-GTC (Generic Token Card) - nincs TLS/tanusitvany",
+    26: "MS-EAP-Authentication / EAP-MSCHAPv2 - kozvetlen MSCHAPv2 challenge/response, "
+        "nincs kulso TLS alagut, tehat nincs szerver-tanusitvany sem",
+    43: "EAP-FAST - sajat PAC-alapu alagutmechanizmust hasznal, nem TLS-Certificate flow-t "
+        "(ez a szkript nem tamogatja)",
 }
 
 FLAG_LENGTH_INCLUDED = 0x80
@@ -194,6 +237,12 @@ def parse_eap_peap(eap_packet: bytes, expected_type: int | None = None) -> EapPe
     type_data = eap_packet[5:length]
 
     if eap_type not in SUPPORTED_TLS_TUNNEL_TYPES:
+        if eap_type in KNOWN_NON_TLS_EAP_TYPES:
+            raise ValueError(
+                f"A szerver EAP tipus {eap_type}-et hasznal: {KNOWN_NON_TLS_EAP_TYPES[eap_type]}. "
+                f"Ez nem TLS-alagutas modszer, ezert ezzel a szerverrel/kliens-konfiguracioval "
+                f"nem lehet tanusitvanyt lekerdezni."
+            )
         supported = ", ".join(f"{t}={n}" for t, n in SUPPORTED_TLS_TUNNEL_TYPES.items())
         raise ValueError(f"varatlan/nem tamogatott EAP tipus: {eap_type} (tamogatott tipusok: {supported})")
     if expected_type is not None and eap_type != expected_type:
@@ -249,7 +298,14 @@ def _tls_extension(ext_type: int, data: bytes) -> bytes:
     return struct.pack(">HH", ext_type, len(data)) + data
 
 
-def build_client_hello_record() -> bytes:
+def build_client_hello_record(record_version: bytes = b"\x03\x03") -> bytes:
+    """record_version: a TLS rekordreteg fejleceben szereplo verzio (a
+    handshake test mindig TLS1.2-t (0x03,0x03) jelez fuggetlenul ettol).
+    Egyes regebbi EAP-TTLS implementaciok (pl. regi OpenSSL-re epulo
+    szerverek) erzekenyek lehetnek erre a mezore - ha egy szerver mar a
+    ClientHello-n elakad, erdemes 0x03,0x01-re (TLS1.0-stilus record
+    layer, a legelterjedtebb kompatibilitasi konvencio) valtani a
+    --legacy-record-version kapcsoloval."""
     client_version = b"\x03\x03"  # TLS 1.2
     rnd = os.urandom(32)
     session_id = b"\x00"
@@ -284,7 +340,7 @@ def build_client_hello_record() -> bytes:
         + extensions
     )
     handshake_msg = bytes([0x01]) + len(body).to_bytes(3, "big") + body  # 0x01 = ClientHello
-    record = bytes([0x16]) + b"\x03\x03" + struct.pack(">H", len(handshake_msg)) + handshake_msg
+    record = bytes([0x16]) + record_version + struct.pack(">H", len(handshake_msg)) + handshake_msg
     return record
 
 
@@ -425,6 +481,7 @@ def probe_certificate(
     timeout: float,
     source_ip: str | None = None,
     extra_attrs: list[tuple[int, bytes]] | None = None,
+    record_version: bytes = b"\x03\x03",
 ) -> list[bytes]:
     conv = RadiusConversation(server, port, secret, nas_ip, timeout, source_ip=source_ip, extra_attrs=extra_attrs)
 
@@ -438,7 +495,8 @@ def probe_certificate(
         raise RuntimeError(
             "A szerver azonnal elutasitotta a kapcsolatot (Access-Reject) mar az Identity-nel "
             "(gyakori ok: ismeretlen/nem engedelyezett outer felhasznalonev, vagy hianyzo "
-            "Connection Request Policy feltetel - lasd --service-type/--nas-port-type/--calling-station-id)."
+            "Connection Request Policy feltetel - lasd --service-type/--nas-port-type/--calling-station-id). "
+            f"Szerver diagnosztika: {reject_diagnostics(attrs)}"
         )
     eap_bytes = get_eap_message(attrs)
     frame = parse_eap_peap(eap_bytes)  # meg nem tudjuk melyik tipus, most ismerjuk fel
@@ -451,12 +509,17 @@ def probe_certificate(
     #    Ugyanazt az EAP tipust hasznaljuk a valaszunkban, amit a szerver az
     #    elozo lepesben jelzett (EAP-TLS/EAP-TTLS/PEAP mind ugyanazt a kulso
     #    TLS-alagutfelepitest hasznaljak, csak a tipusszam ter el).
-    client_hello = build_client_hello_record()
+    client_hello = build_client_hello_record(record_version)
     code, attrs = conv.send_eap(
         build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=client_hello), username=identity
     )
     if code == ACCESS_REJECT:
-        raise RuntimeError("A szerver elutasitotta a ClientHello-t (Access-Reject).")
+        raise RuntimeError(
+            "A szerver elutasitotta a ClientHello-t (Access-Reject). Ez tipikusan azt jelenti, "
+            "hogy a szerver TLS stack-je nem fogadta el a felajanlott cipher suite-eket / "
+            "extension-oket, vagy a record-layer verziot. Probald ki a --legacy-record-version "
+            f"kapcsolot. Szerver diagnosztika: {reject_diagnostics(attrs)}"
+        )
 
     # 3) A szerver ServerHello+Certificate+ServerHelloDone flight-jenek
     #    osszegyujtese - ez tobb EAP-fragmensre (M bit) is szethullhat,
@@ -479,7 +542,10 @@ def probe_certificate(
                 build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=b""), username=identity
             )
             if code == ACCESS_REJECT:
-                raise RuntimeError("A szerver elutasitotta a fragmens ACK-ot (Access-Reject).")
+                raise RuntimeError(
+                    f"A szerver elutasitotta a fragmens ACK-ot (Access-Reject). "
+                    f"Szerver diagnosztika: {reject_diagnostics(attrs)}"
+                )
             continue
         else:
             # ez volt az utolso fragmens ebben a flight-ban - megvan, amire
@@ -511,14 +577,53 @@ def main() -> None:
              "es van --source-ip, akkor azt hasznaljuk; egyebkent 127.0.0.1.",
     )
     parser.add_argument("--timeout", type=float, default=5.0, help="UDP valasz timeout masodpercben")
+    parser.add_argument(
+        "--legacy-record-version",
+        action="store_true",
+        help="A TLS ClientHello record-reteget 0x03,0x01 (TLS1.0-stilus) verzioval kuldi "
+             "0x03,0x03 (TLS1.2) helyett - egyes regebbi EAP-TTLS/PEAP implementaciok "
+             "erzekenyek erre. Csak akkor probald, ha a ClientHello utan Access-Reject jon.",
+    )
+    parser.add_argument(
+        "--service-type", type=int, default=None,
+        help="Opcionalis Service-Type attributum (pl. 2=Framed). Nehany Connection Request "
+             "Policy megkoveteli.",
+    )
+    parser.add_argument(
+        "--nas-port-type", type=int, default=None,
+        help="Opcionalis NAS-Port-Type attributum (pl. 15=Ethernet, 19=Wireless-802.11). "
+             "Nehany Connection Request Policy megkoveteli.",
+    )
+    parser.add_argument(
+        "--calling-station-id", default=None,
+        help="Opcionalis Calling-Station-Id attributum (pl. kliens MAC cime 'AA-BB-CC-DD-EE-FF' "
+             "formatumban). Nehany Connection Request Policy megkoveteli.",
+    )
+    parser.add_argument(
+        "--framed-protocol", type=int, default=None,
+        help="Opcionalis Framed-Protocol attributum (pl. 1=PPP).",
+    )
     args = parser.parse_args()
 
     nas_ip = args.nas_ip or args.source_ip or "127.0.0.1"
+    record_version = b"\x03\x01" if args.legacy_record_version else b"\x03\x03"
+
+    extra_attrs: list[tuple[int, bytes]] = []
+    if args.service_type is not None:
+        extra_attrs.append((ATTR_SERVICE_TYPE, struct.pack(">I", args.service_type)))
+    if args.nas_port_type is not None:
+        extra_attrs.append((ATTR_NAS_PORT_TYPE, struct.pack(">I", args.nas_port_type)))
+    if args.calling_station_id is not None:
+        extra_attrs.append((ATTR_CALLING_STATION_ID, args.calling_station_id.encode()))
+    if args.framed_protocol is not None:
+        extra_attrs.append((ATTR_FRAMED_PROTOCOL, struct.pack(">I", args.framed_protocol)))
 
     try:
         certs = probe_certificate(
             args.server, args.port, args.secret, args.identity, nas_ip, args.timeout,
             source_ip=args.source_ip,
+            extra_attrs=extra_attrs or None,
+            record_version=record_version,
         )
     except (TimeoutError, RuntimeError, ValueError) as e:
         sys.exit(f"HIBA: {e}")
