@@ -318,7 +318,15 @@ def print_certificates(der_certs: list[bytes]) -> None:
 # ----------------------------------------------------------------------------
 
 class RadiusConversation:
-    def __init__(self, server: str, port: int, secret: str, nas_ip: str, timeout: float):
+    def __init__(
+        self,
+        server: str,
+        port: int,
+        secret: str,
+        nas_ip: str,
+        timeout: float,
+        source_ip: str | None = None,
+    ):
         self.server = server
         self.port = port
         self.secret = secret.encode()
@@ -327,6 +335,18 @@ class RadiusConversation:
         self.radius_id = os.urandom(1)[0]
         self.state: bytes | None = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if source_ip:
+            # A forras IP-re bindolt UDP socketrol kimeno csomagok EZZEL a
+            # cimmel jelennek meg a szerver oldalan - igy tobb-cimu kliens
+            # eseten kikenyszerithetjuk, hogy melyik interfeszrol/cimrol
+            # menjen ki a keres (pl. ha az NPS policy csak egy adott
+            # forras IP-t enged).
+            try:
+                self.sock.bind((source_ip, 0))
+            except OSError as e:
+                raise RuntimeError(
+                    f"Nem sikerult a socketet a(z) {source_ip} forras cimre bindolni: {e}"
+                ) from e
         self.sock.settimeout(timeout)
 
     def _next_radius_id(self) -> int:
@@ -353,8 +373,16 @@ class RadiusConversation:
         raise TimeoutError(f"Nincs valasz a RADIUS szervertol ({self.server}:{self.port}) {retries} probalkozas utan") from last_err
 
 
-def probe_certificate(server: str, port: int, secret: str, identity: str, nas_ip: str, timeout: float) -> list[bytes]:
-    conv = RadiusConversation(server, port, secret, nas_ip, timeout)
+def probe_certificate(
+    server: str,
+    port: int,
+    secret: str,
+    identity: str,
+    nas_ip: str,
+    timeout: float,
+    source_ip: str | None = None,
+) -> list[bytes]:
+    conv = RadiusConversation(server, port, secret, nas_ip, timeout, source_ip=source_ip)
 
     # 1) EAP-Response/Identity - ez inditja a szerver oldali EAP/PEAP folyamatot.
     #    Az outer identity ertekenek NEM kell valos felhasznalonak lennie:
@@ -412,12 +440,29 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=1812, help="RADIUS auth port (alap: 1812)")
     parser.add_argument("--secret", required=True, help="RADIUS megosztott kulcs (PSK)")
     parser.add_argument("--identity", default="anonymous", help="Outer EAP identity (nem kell valodi felhasznalo)")
-    parser.add_argument("--nas-ip", default="127.0.0.1", help="A NAS-IP-Address attributumhoz kuldott sajat IP")
+    parser.add_argument(
+        "--source-ip",
+        default=None,
+        help="Forras IP cim, ahonnan a kereseket kuldjuk (tobb-cimu klienshez, "
+             "ha a szerver policy csak egy adott forras cimrol fogad kereseket). "
+             "Ha nincs megadva, az OS valasztja ki az utvonalazas alapjan.",
+    )
+    parser.add_argument(
+        "--nas-ip",
+        default=None,
+        help="A NAS-IP-Address attributumhoz kuldott cim. Ha nincs megadva, "
+             "es van --source-ip, akkor azt hasznaljuk; egyebkent 127.0.0.1.",
+    )
     parser.add_argument("--timeout", type=float, default=5.0, help="UDP valasz timeout masodpercben")
     args = parser.parse_args()
 
+    nas_ip = args.nas_ip or args.source_ip or "127.0.0.1"
+
     try:
-        certs = probe_certificate(args.server, args.port, args.secret, args.identity, args.nas_ip, args.timeout)
+        certs = probe_certificate(
+            args.server, args.port, args.secret, args.identity, nas_ip, args.timeout,
+            source_ip=args.source_ip,
+        )
     except (TimeoutError, RuntimeError, ValueError) as e:
         sys.exit(f"HIBA: {e}")
 
