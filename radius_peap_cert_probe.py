@@ -45,10 +45,14 @@ ACCESS_CHALLENGE = 11
 
 ATTR_USER_NAME = 1
 ATTR_NAS_IP_ADDRESS = 4
+ATTR_SERVICE_TYPE = 6
+ATTR_FRAMED_PROTOCOL = 7
+ATTR_CALLING_STATION_ID = 31
 ATTR_STATE = 24
 ATTR_NAS_IDENTIFIER = 32
 ATTR_EAP_MESSAGE = 79
 ATTR_MESSAGE_AUTHENTICATOR = 80
+ATTR_NAS_PORT_TYPE = 61
 
 
 def _encode_attr(t: int, value: bytes) -> bytes:
@@ -70,10 +74,16 @@ def build_access_request(
     username: str,
     nas_ip: str,
     state: bytes | None,
+    extra_attrs: list[tuple[int, bytes]] | None = None,
 ) -> bytes:
     """Felepiti az Access-Request csomagot, a szukseg szerint tobb EAP-Message
     attributumra darabolva az EAP payloadot (attributum-szintu fragmentacio),
-    es a vegen kiszamitja a Message-Authenticator HMAC-MD5-öt (RFC 3579)."""
+    es a vegen kiszamitja a Message-Authenticator HMAC-MD5-öt (RFC 3579).
+
+    extra_attrs: tovabbi RADIUS attributumok (pl. Service-Type, NAS-Port-Type,
+    Calling-Station-Id) - sok NPS Connection Request / Network Policy ezeket
+    a feltetelek reszekent megkoveteli, enelkul mar az elso Access-Request-et
+    elutasitja, meg mielott az EAP targyalas elkezdodne."""
     request_authenticator = os.urandom(16)
 
     attrs: list[tuple[int, bytes]] = [
@@ -81,6 +91,8 @@ def build_access_request(
         (ATTR_NAS_IP_ADDRESS, socket.inet_aton(nas_ip)),
         (ATTR_NAS_IDENTIFIER, b"python-peap-cert-probe"),
     ]
+    if extra_attrs:
+        attrs.extend(extra_attrs)
     if state is not None:
         attrs.append((ATTR_STATE, state))
     for chunk in _split_chunks(eap_packet, 253):
@@ -138,7 +150,20 @@ EAP_SUCCESS = 3
 EAP_FAILURE = 4
 
 EAP_TYPE_IDENTITY = 1
+EAP_TYPE_TLS = 13
+EAP_TYPE_TTLS = 21
 EAP_TYPE_PEAP = 25
+
+# Ez a harom EAP-tipus mind ugyanazt a "flags byte + opcionalis 4-byte
+# total-length + TLS adat" fragmentacios fejlecformatumot hasznalja
+# (RFC 5216 EAP-TLS format, amit a PEAP es a TTLS is atvett), ezert a
+# kulso TLS handshake / tanusitvany-lekerdezes szempontjabol azonosan
+# kezelhetok - csak az EAP tipusszam ter el.
+SUPPORTED_TLS_TUNNEL_TYPES = {
+    EAP_TYPE_TLS: "EAP-TLS",
+    EAP_TYPE_TTLS: "EAP-TTLS",
+    EAP_TYPE_PEAP: "PEAP",
+}
 
 FLAG_LENGTH_INCLUDED = 0x80
 FLAG_MORE_FRAGMENTS = 0x40
@@ -149,27 +174,42 @@ FLAG_START = 0x20
 class EapPeapFrame:
     eap_code: int
     eap_id: int
+    eap_type: int
     flags: int
     total_length: int | None
     payload: bytes
 
 
-def parse_eap_peap(eap_packet: bytes) -> EapPeapFrame:
+def parse_eap_peap(eap_packet: bytes, expected_type: int | None = None) -> EapPeapFrame:
+    """expected_type=None eseten barmilyen ismert TLS-alagut tipust (EAP-TLS,
+    EAP-TTLS, PEAP) elfogad es a talalt tipust adja vissza - igy a hivo fel
+    tudja ismerni, melyik EAP modszert hasznalja a szerver. Ha expected_type
+    meg van adva, ellenorzi, hogy a valasz ugyanazt a tipust hasznalja-e
+    (a tunnel felepitese kozben, hogy ne csuszjunk at masik tipusra)."""
     code, ident = eap_packet[0], eap_packet[1]
     length = struct.unpack(">H", eap_packet[2:4])[0]
     if code in (EAP_SUCCESS, EAP_FAILURE):
-        return EapPeapFrame(code, ident, 0, None, b"")
+        return EapPeapFrame(code, ident, expected_type or 0, 0, None, b"")
     eap_type = eap_packet[4]
     type_data = eap_packet[5:length]
-    if eap_type != EAP_TYPE_PEAP:
-        raise ValueError(f"varatlan EAP tipus: {eap_type} (25=PEAP vart)")
+
+    if eap_type not in SUPPORTED_TLS_TUNNEL_TYPES:
+        supported = ", ".join(f"{t}={n}" for t, n in SUPPORTED_TLS_TUNNEL_TYPES.items())
+        raise ValueError(f"varatlan/nem tamogatott EAP tipus: {eap_type} (tamogatott tipusok: {supported})")
+    if expected_type is not None and eap_type != expected_type:
+        raise ValueError(
+            f"a szerver menet kozben mas EAP tipusra valtott: {eap_type} "
+            f"({SUPPORTED_TLS_TUNNEL_TYPES.get(eap_type, '?')}), "
+            f"korabban {expected_type} ({SUPPORTED_TLS_TUNNEL_TYPES.get(expected_type, '?')}) volt"
+        )
+
     flags = type_data[0]
     rest = type_data[1:]
     total_length = None
     if flags & FLAG_LENGTH_INCLUDED:
         total_length = struct.unpack(">I", rest[:4])[0]
         rest = rest[4:]
-    return EapPeapFrame(code, ident, flags, total_length, rest)
+    return EapPeapFrame(code, ident, eap_type, flags, total_length, rest)
 
 
 def build_eap_identity_response(eap_id: int, identity: str) -> bytes:
@@ -178,9 +218,9 @@ def build_eap_identity_response(eap_id: int, identity: str) -> bytes:
     return body
 
 
-def build_eap_peap_response(eap_id: int, flags: int, payload: bytes = b"") -> bytes:
+def build_eap_peap_response(eap_id: int, eap_type: int, flags: int, payload: bytes = b"") -> bytes:
     type_data = bytes([flags]) + payload
-    full = bytes([EAP_TYPE_PEAP]) + type_data
+    full = bytes([eap_type]) + type_data
     body = bytes([EAP_RESPONSE, eap_id]) + struct.pack(">H", 4 + len(full)) + full
     return body
 
@@ -326,12 +366,14 @@ class RadiusConversation:
         nas_ip: str,
         timeout: float,
         source_ip: str | None = None,
+        extra_attrs: list[tuple[int, bytes]] | None = None,
     ):
         self.server = server
         self.port = port
         self.secret = secret.encode()
         self.nas_ip = nas_ip
         self.timeout = timeout
+        self.extra_attrs = extra_attrs or []
         self.radius_id = os.urandom(1)[0]
         self.state: bytes | None = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -355,7 +397,8 @@ class RadiusConversation:
 
     def send_eap(self, eap_packet: bytes, username: str = "anonymous", retries: int = 3) -> tuple[int, list[tuple[int, bytes]]]:
         packet = build_access_request(
-            self._next_radius_id(), self.secret, eap_packet, username, self.nas_ip, self.state
+            self._next_radius_id(), self.secret, eap_packet, username, self.nas_ip, self.state,
+            extra_attrs=self.extra_attrs,
         )
         last_err: Exception | None = None
         for attempt in range(retries):
@@ -381,8 +424,9 @@ def probe_certificate(
     nas_ip: str,
     timeout: float,
     source_ip: str | None = None,
+    extra_attrs: list[tuple[int, bytes]] | None = None,
 ) -> list[bytes]:
-    conv = RadiusConversation(server, port, secret, nas_ip, timeout, source_ip=source_ip)
+    conv = RadiusConversation(server, port, secret, nas_ip, timeout, source_ip=source_ip, extra_attrs=extra_attrs)
 
     # 1) EAP-Response/Identity - ez inditja a szerver oldali EAP/PEAP folyamatot.
     #    Az outer identity ertekenek NEM kell valos felhasznalonak lennie:
@@ -391,15 +435,26 @@ def probe_certificate(
     eap_id = 1
     code, attrs = conv.send_eap(build_eap_identity_response(eap_id, identity), username=identity)
     if code == ACCESS_REJECT:
-        raise RuntimeError("A szerver azonnal elutasitotta a kapcsolatot (Access-Reject) mar az Identity-nel.")
+        raise RuntimeError(
+            "A szerver azonnal elutasitotta a kapcsolatot (Access-Reject) mar az Identity-nel "
+            "(gyakori ok: ismeretlen/nem engedelyezett outer felhasznalonev, vagy hianyzo "
+            "Connection Request Policy feltetel - lasd --service-type/--nas-port-type/--calling-station-id)."
+        )
     eap_bytes = get_eap_message(attrs)
-    frame = parse_eap_peap(eap_bytes)
+    frame = parse_eap_peap(eap_bytes)  # meg nem tudjuk melyik tipus, most ismerjuk fel
+    eap_type = frame.eap_type
+    print(f"Felismert EAP tipus: {SUPPORTED_TLS_TUNNEL_TYPES[eap_type]} (tipusszam {eap_type})", file=sys.stderr)
     if not (frame.flags & FLAG_START):
-        print("FIGYELEM: a szerver elso valasza nem tartalmazott PEAP Start jelzest, folytatjuk azert.", file=sys.stderr)
+        print("FIGYELEM: a szerver elso valasza nem tartalmazott Start jelzest, folytatjuk azert.", file=sys.stderr)
 
     # 2) ClientHello elkuldese (egyetlen fragmensben, mivel a ClientHello kicsi).
+    #    Ugyanazt az EAP tipust hasznaljuk a valaszunkban, amit a szerver az
+    #    elozo lepesben jelzett (EAP-TLS/EAP-TTLS/PEAP mind ugyanazt a kulso
+    #    TLS-alagutfelepitest hasznaljak, csak a tipusszam ter el).
     client_hello = build_client_hello_record()
-    code, attrs = conv.send_eap(build_eap_peap_response(frame.eap_id, flags=0, payload=client_hello), username=identity)
+    code, attrs = conv.send_eap(
+        build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=client_hello), username=identity
+    )
     if code == ACCESS_REJECT:
         raise RuntimeError("A szerver elutasitotta a ClientHello-t (Access-Reject).")
 
@@ -409,7 +464,7 @@ def probe_certificate(
     tls_buffer = bytearray()
     while True:
         eap_bytes = get_eap_message(attrs)
-        frame = parse_eap_peap(eap_bytes)
+        frame = parse_eap_peap(eap_bytes, expected_type=eap_type)
 
         if frame.eap_code == EAP_FAILURE:
             raise RuntimeError("A szerver EAP-Failure-t kuldott a TLS handshake kozben.")
@@ -420,7 +475,9 @@ def probe_certificate(
 
         if frame.flags & FLAG_MORE_FRAGMENTS:
             # ures ACK a kovetkezo fragmensert
-            code, attrs = conv.send_eap(build_eap_peap_response(frame.eap_id, flags=0, payload=b""), username=identity)
+            code, attrs = conv.send_eap(
+                build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=b""), username=identity
+            )
             if code == ACCESS_REJECT:
                 raise RuntimeError("A szerver elutasitotta a fragmens ACK-ot (Access-Reject).")
             continue
