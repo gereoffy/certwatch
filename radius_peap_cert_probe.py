@@ -267,8 +267,14 @@ def build_eap_identity_response(eap_id: int, identity: str) -> bytes:
     return body
 
 
-def build_eap_peap_response(eap_id: int, eap_type: int, flags: int, payload: bytes = b"") -> bytes:
-    type_data = bytes([flags]) + payload
+def build_eap_peap_response(
+    eap_id: int, eap_type: int, flags: int, payload: bytes = b"", total_length: int | None = None
+) -> bytes:
+    if total_length is not None:
+        flags |= FLAG_LENGTH_INCLUDED
+        type_data = bytes([flags]) + struct.pack(">I", total_length) + payload
+    else:
+        type_data = bytes([flags]) + payload
     full = bytes([eap_type]) + type_data
     body = bytes([EAP_RESPONSE, eap_id]) + struct.pack(">H", 4 + len(full)) + full
     return body
@@ -283,10 +289,17 @@ def build_eap_peap_response(eap_id: int, eap_type: int, flags: int, payload: byt
 # erkezik - ez minden TLS 1.2 RSA/ECDHE-RSA suite-ra igaz, szoval bovebb
 # kompatibilitas kedveert mindkettobol ajanlunk fel nehanyat.
 CIPHER_SUITES = [
+    0xC02B,  # TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    0xC02C,  # TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    0xC02F,  # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    0xC030,  # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    0xCCA8,  # TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
     0xC027,  # TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
     0xC013,  # TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
     0xC028,  # TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
     0xC014,  # TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+    0x009C,  # TLS_RSA_WITH_AES_128_GCM_SHA256
+    0x009D,  # TLS_RSA_WITH_AES_256_GCM_SHA384
     0x003C,  # TLS_RSA_WITH_AES_128_CBC_SHA256
     0x002F,  # TLS_RSA_WITH_AES_128_CBC_SHA
     0x003D,  # TLS_RSA_WITH_AES_256_CBC_SHA256
@@ -423,6 +436,7 @@ class RadiusConversation:
         timeout: float,
         source_ip: str | None = None,
         extra_attrs: list[tuple[int, bytes]] | None = None,
+        debug: bool = False,
     ):
         self.server = server
         self.port = port
@@ -430,6 +444,7 @@ class RadiusConversation:
         self.nas_ip = nas_ip
         self.timeout = timeout
         self.extra_attrs = extra_attrs or []
+        self.debug = debug
         self.radius_id = os.urandom(1)[0]
         self.state: bytes | None = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -456,11 +471,16 @@ class RadiusConversation:
             self._next_radius_id(), self.secret, eap_packet, username, self.nas_ip, self.state,
             extra_attrs=self.extra_attrs,
         )
+        if self.debug:
+            print(f"--> Access-Request ({len(packet)} byte):\n{packet.hex(' ')}", file=sys.stderr)
+            print(f"    benne EAP ({len(eap_packet)} byte): {eap_packet.hex(' ')}", file=sys.stderr)
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
                 self.sock.sendto(packet, (self.server, self.port))
                 data, _ = self.sock.recvfrom(65535)
+                if self.debug:
+                    print(f"<-- valasz ({len(data)} byte):\n{data.hex(' ')}", file=sys.stderr)
                 code, ident, auth, attrs = parse_radius_packet(data)
                 new_state = get_state(attrs)
                 if new_state is not None:
@@ -482,8 +502,11 @@ def probe_certificate(
     source_ip: str | None = None,
     extra_attrs: list[tuple[int, bytes]] | None = None,
     record_version: bytes = b"\x03\x03",
+    debug: bool = False,
 ) -> list[bytes]:
-    conv = RadiusConversation(server, port, secret, nas_ip, timeout, source_ip=source_ip, extra_attrs=extra_attrs)
+    conv = RadiusConversation(
+        server, port, secret, nas_ip, timeout, source_ip=source_ip, extra_attrs=extra_attrs, debug=debug
+    )
 
     # 1) EAP-Response/Identity - ez inditja a szerver oldali EAP/PEAP folyamatot.
     #    Az outer identity ertekenek NEM kell valos felhasznalonak lennie:
@@ -511,7 +534,8 @@ def probe_certificate(
     #    TLS-alagutfelepitest hasznaljak, csak a tipusszam ter el).
     client_hello = build_client_hello_record(record_version)
     code, attrs = conv.send_eap(
-        build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=client_hello), username=identity
+        build_eap_peap_response(frame.eap_id, eap_type, flags=0, payload=client_hello, total_length=len(client_hello)),
+        username=identity,
     )
     if code == ACCESS_REJECT:
         raise RuntimeError(
@@ -603,6 +627,10 @@ def main() -> None:
         "--framed-protocol", type=int, default=None,
         help="Opcionalis Framed-Protocol attributum (pl. 1=PPP).",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Minden kuldott/fogadott RADIUS csomag nyers hexdump-jat kiirja stderr-re.",
+    )
     args = parser.parse_args()
 
     nas_ip = args.nas_ip or args.source_ip or "127.0.0.1"
@@ -624,6 +652,7 @@ def main() -> None:
             source_ip=args.source_ip,
             extra_attrs=extra_attrs or None,
             record_version=record_version,
+            debug=args.debug,
         )
     except (TimeoutError, RuntimeError, ValueError) as e:
         sys.exit(f"HIBA: {e}")
