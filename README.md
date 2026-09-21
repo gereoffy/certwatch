@@ -10,13 +10,22 @@ Supported protocols:
 - ftp auth tls (21)
 
 
+If the normal (verified) connection fails - expired certificate, private or
+self-signed CA, missing intermediate, hostname mismatch - the host is probed
+again with verification disabled (CERT_NONE, no hostname check, relaxed
+ciphers, TLS capped at 1.2 so the Certificate message stays in cleartext), and
+the report contains the whole received chain: subject, SAN, issuer, validity
+with days left, serial, CA / self-signed flags, plus whether the hostname
+matches. The days-left value then comes from the unverified leaf, so an already
+expired certificate still gets a real (negative) day count and sorts to the top
+of the report.
+
+Only the Python standard library is needed (the certificates are parsed from
+DER by the built-in reader in certwatch.py).
+
+
 Usage:
 
 ./certwatch [emailaddress]  
 (if email address given, results will be sent to email instead of stdout)
 
-# radius_peap_cert_probe - Radius SSL cert checker
-
-easy way to query EAP-TLS/TTLS/PEAP radius server certificates! written by Claude.AI (free edition, Sonnet 5)
-
-Usage: ./radius_peap_cert_probe.py --server IP --secret "psk" --identity username

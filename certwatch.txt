@@ -1,6 +1,7 @@
-# web
-arp.interoot.hu:443
-
-# mail
-mx.pymavis.cloud:25
-webmail.interoot.hu:143
+# test cases (badssl.com) - remove these on the real server
+badssl.com:443                  # valid, verified path
+expired.badssl.com:443          # expired -> negative day count from the unverified leaf
+self-signed.badssl.com:443      # self-signed
+untrusted-root.badssl.com:443   # private/unknown CA
+incomplete-chain.badssl.com:443 # intermediate not sent by the server
+wrong.host.badssl.com:443       # valid cert, wrong hostname
