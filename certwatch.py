@@ -14,6 +14,13 @@ print the received chain in detail.  The days-left value then comes from the
 unverified leaf, so an already expired certificate still gets a real (negative)
 day count instead of a useless error.
 
+RADIUS realms are handled as well: an "eduroam@edu-realm.com:1812" style entry
+means the TLS handshake is carried inside EAP-PEAP / EAP-TTLS over RADIUS, to
+the proxy configured below.  Only the outer tunnel is done - no inner
+authentication, no password: we wait for the server certificate and then drop
+the session, exactly the way we hang up after the cert on the TCP side.  (The
+full conversation, with inner auth, is radprobe.py.)
+
 Only the Python standard library is used; the certificates are parsed from
 their DER form by the small X.509 reader below.
 
@@ -23,17 +30,28 @@ Usage:
 """
 
 import sys
+import os
 import ssl
 import socket
+import struct
+import hmac
+import hashlib
 import datetime
 import ipaddress
 import re
 import subprocess
 
 HOSTLIST = "certwatch.txt"
-TIMEOUT = 10                            # seconds, per connection
-EHLO_NAME = "FIXME.to.myhostname.hu"    # name we announce in SMTP EHLO
-MAIL_FROM = "Cert-watch <root@FIXME.to.myhostname.hu>"
+TIMEOUT = 10                            # seconds, per connection / per RADIUS try
+EHLO_NAME = "my.hostname.hu"            # name we announce in SMTP EHLO
+MAIL_FROM = "Cert-watch <root@mydomain.hu>"
+
+# RADIUS: every "identity@realm:1812" entry of the host list is sent to this proxy with this shared secret.
+RADIUS_SERVER = "127.0.0.1"
+RADIUS_SECRET = "testing123"
+RADIUS_NAS_ID = "certwatch"
+RADIUS_CALLING_STATION = "02-00-00-00-00-01"    # some policies want a MAC
+RADIUS_RETRIES = 2                      # UDP: how many times a request is resent
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +250,10 @@ def fmt_time(dt):
 
 
 # ---------------------------------------------------------------------------
-# Connection: TCP + the STARTTLS dance where it is needed
+# Transports.  The TLS handshake below is driven by hand over a MemoryBIO pair,
+# so it does not care what carries the records: a TCP socket, or EAP-Message
+# attributes of RADIUS packets.  Both transports offer the same two methods:
+# send(bytes) and recv() -> bytes.
 # ---------------------------------------------------------------------------
 
 def connect(host, port):
@@ -259,6 +280,222 @@ def connect(host, port):
         sock.close()
         raise
     return sock
+
+
+class TcpTransport(object):
+    """TLS records over a plain TCP connection."""
+
+    def __init__(self, host, port):
+        self.sock = connect(host, port)
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+    def recv(self):
+        return self.sock.recv(16384)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# RADIUS / EAP transport
+#
+# The TLS handshake of an EAP-PEAP / EAP-TTLS tunnel travels in EAP-Message
+# attributes of RADIUS Access-Requests.  We only do the outer tunnel: identity,
+# method negotiation, then the handshake until the certificate is on the table.
+# No inner authentication and no password is ever sent; the half-finished
+# RADIUS session is dropped by the server on its own timeout.
+# ---------------------------------------------------------------------------
+
+ACCESS_REQUEST, ACCESS_REJECT, ACCESS_CHALLENGE = 1, 3, 11
+ATTR_USER_NAME, ATTR_NAS_IP, ATTR_SERVICE_TYPE = 1, 4, 6
+ATTR_REPLY_MESSAGE, ATTR_STATE, ATTR_CALLING_STATION = 18, 24, 31
+ATTR_NAS_IDENTIFIER, ATTR_NAS_PORT_TYPE = 32, 61
+ATTR_EAP_MESSAGE, ATTR_MESSAGE_AUTHENTICATOR = 79, 80
+
+EAP_RESPONSE, EAP_SUCCESS, EAP_FAILURE = 2, 3, 4
+EAP_TYPE_IDENTITY, EAP_TYPE_NAK = 1, 3
+EAP_FLAG_LENGTH, EAP_FLAG_MORE = 0x80, 0x40
+TUNNEL_TYPES = {13: "EAP-TLS", 21: "EAP-TTLS", 25: "EAP-PEAP"}
+
+
+def eap_identity(eap_id, identity):
+    body = bytes([EAP_TYPE_IDENTITY]) + identity.encode()
+    return bytes([EAP_RESPONSE, eap_id]) + struct.pack(">H", 4 + len(body)) + body
+
+
+def eap_nak(eap_id, wanted_type):
+    """Legacy Nak: ask for a different EAP type than the offered one (RFC 3748)."""
+    body = bytes([EAP_TYPE_NAK, wanted_type])
+    return bytes([EAP_RESPONSE, eap_id]) + struct.pack(">H", 4 + len(body)) + body
+
+
+def eap_tls_payload(eap_id, eap_type, payload):
+    """EAP response carrying our TLS flight; an empty payload is the ACK of a
+    fragmented server flight."""
+    if payload:
+        body = (bytes([eap_type, EAP_FLAG_LENGTH])
+                + struct.pack(">I", len(payload)) + payload)
+    else:
+        body = bytes([eap_type, 0])
+    return bytes([EAP_RESPONSE, eap_id]) + struct.pack(">H", 4 + len(body)) + body
+
+
+def parse_eap(eap):
+    """(code, id, type, flags, tls payload) of an EAP packet."""
+    code, eap_id = eap[0], eap[1]
+    length = min(struct.unpack(">H", eap[2:4])[0], len(eap))
+    if code in (EAP_SUCCESS, EAP_FAILURE) or length < 5:
+        return code, eap_id, None, 0, b""
+    eap_type = eap[4]
+    flags = eap[5] if length >= 6 else 0
+    payload = eap[10:length] if flags & EAP_FLAG_LENGTH else eap[6:length]
+    return code, eap_id, eap_type, flags, payload
+
+
+def radius_request(rid, eap_packet, identity, nas_ip, state):
+    """Access-Request with the EAP packet split into 253 byte EAP-Message
+    attributes, closed by the Message-Authenticator HMAC-MD5 (RFC 3579)."""
+    pairs = [
+        (ATTR_USER_NAME, identity.encode()),
+        (ATTR_NAS_IP, socket.inet_aton(nas_ip)),
+        (ATTR_NAS_IDENTIFIER, RADIUS_NAS_ID.encode()),
+        (ATTR_SERVICE_TYPE, struct.pack(">I", 2)),      # Framed
+        (ATTR_NAS_PORT_TYPE, struct.pack(">I", 19)),    # Wireless-802.11
+        (ATTR_CALLING_STATION, RADIUS_CALLING_STATION.encode()),
+    ]
+    if state is not None:
+        pairs.append((ATTR_STATE, state))
+    for pos in range(0, len(eap_packet), 253):
+        pairs.append((ATTR_EAP_MESSAGE, eap_packet[pos:pos + 253]))
+    pairs.append((ATTR_MESSAGE_AUTHENTICATOR, b"\x00" * 16))   # placeholder, last
+    body = b"".join(bytes([t, len(v) + 2]) + v for t, v in pairs)
+    packet = (bytes([ACCESS_REQUEST, rid]) + struct.pack(">H", 20 + len(body))
+              + os.urandom(16) + body)
+    return packet[:-16] + hmac.new(RADIUS_SECRET.encode(), packet, hashlib.md5).digest()
+
+
+def radius_parse(data):
+    """(code, [(type, value), ...]) of a RADIUS packet."""
+    length = min(struct.unpack(">H", data[2:4])[0], len(data))
+    attrs = []
+    pos = 20
+    while pos + 2 <= length:
+        t, l = data[pos], data[pos + 1]
+        if l < 2:
+            break
+        attrs.append((t, data[pos + 2:pos + l]))
+        pos += l
+    return data[0], attrs
+
+
+def attr_join(attrs, t):
+    return b"".join(v for k, v in attrs if k == t)
+
+
+def attr_first(attrs, t):
+    for k, v in attrs:
+        if k == t:
+            return v
+    return None
+
+
+def reply_message(attrs):
+    msgs = [v.decode("utf-8", "replace") for k, v in attrs if k == ATTR_REPLY_MESSAGE]
+    return " (%s)" % "; ".join(msgs) if msgs else ""
+
+
+class RadiusTransport(object):
+    """TLS records inside an EAP-PEAP / EAP-TTLS tunnel, over RADIUS/UDP."""
+
+    def __init__(self, identity, port):
+        self.identity = identity
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(TIMEOUT)
+        self.sock.connect((RADIUS_SERVER, port))
+        self.nas_ip = self.sock.getsockname()[0]
+        self.rid = os.urandom(1)[0]
+        self.state = None
+        self.attrs = []
+        self.eap_id = 1
+        self.eap_type = None
+        self.method = "EAP"
+        self._negotiate()
+
+    def _exchange(self, eap_packet):
+        """One Access-Request / Access-Challenge round trip."""
+        self.rid = (self.rid + 1) % 256
+        packet = radius_request(self.rid, eap_packet, self.identity, self.nas_ip, self.state)
+        for _ in range(RADIUS_RETRIES):
+            self.sock.send(packet)
+            try:
+                data = self.sock.recv(4096)
+            except socket.timeout:
+                continue                # UDP: the request or the reply was lost
+            code, attrs = radius_parse(data)
+            state = attr_first(attrs, ATTR_STATE)
+            if state is not None:
+                self.state = state
+            if code == ACCESS_REJECT:
+                raise RuntimeError("RADIUS Access-Reject%s" % reply_message(attrs))
+            if code != ACCESS_CHALLENGE:
+                raise RuntimeError("unexpected RADIUS reply code %d%s"
+                                   % (code, reply_message(attrs)))
+            self.attrs = attrs
+            return attrs
+        raise socket.timeout("no reply from the RADIUS server %s" % RADIUS_SERVER)
+
+    def _negotiate(self):
+        """Identity, then get the server onto a TLS tunnel type (Nak if needed)."""
+        attrs = self._exchange(eap_identity(self.eap_id, self.identity))
+        wanted = [25, 21]               # ask for PEAP first, then TTLS
+        for _ in range(1 + len(wanted)):
+            eap = attr_join(attrs, ATTR_EAP_MESSAGE)
+            if len(eap) < 4:
+                raise RuntimeError("no EAP-Message in the RADIUS reply")
+            code, self.eap_id, etype, _, _ = parse_eap(eap)
+            if code == EAP_FAILURE:
+                raise RuntimeError("EAP-Failure during the outer negotiation")
+            if etype in TUNNEL_TYPES:
+                self.eap_type = etype
+                self.method = TUNNEL_TYPES[etype]
+                return
+            attrs = self._exchange(eap_nak(self.eap_id, wanted.pop(0)))
+        raise RuntimeError("the server offers no EAP tunnel type (PEAP/TTLS) "
+                           "for this identity")
+
+    def send(self, data):
+        # No outgoing fragmentation: our flights fit in one RADIUS packet (we
+        # never send a client certificate, that is what would not fit).
+        self._exchange(eap_tls_payload(self.eap_id, self.eap_type, data))
+
+    def recv(self):
+        """The server's TLS flight, reassembled from the EAP fragments (M bit)."""
+        flight = bytearray()
+        while True:
+            eap = attr_join(self.attrs, ATTR_EAP_MESSAGE)
+            if len(eap) < 4:
+                raise RuntimeError("no EAP-Message in the RADIUS reply")
+            code, self.eap_id, etype, flags, payload = parse_eap(eap)
+            if code in (EAP_SUCCESS, EAP_FAILURE):
+                raise RuntimeError("EAP-%s instead of the TLS handshake"
+                                   % ("Success" if code == EAP_SUCCESS else "Failure"))
+            if etype != self.eap_type:
+                raise RuntimeError("the server switched EAP type mid-handshake (%s)" % etype)
+            flight += payload
+            if not flags & EAP_FLAG_MORE:
+                return bytes(flight)
+            self._exchange(eap_tls_payload(self.eap_id, self.eap_type, b""))   # ACK
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -292,15 +529,17 @@ def unsafe_context(allow_tls13):
     return ctx
 
 
-def tls_probe(sock, host, allow_tls13):
-    """Drive the unverified handshake manually; returns (der_certs, error)."""
+def tls_probe(transport, ctx, sni, stop_after_cert=False):
+    """Drive the handshake by hand over the transport, keeping the raw bytes.
+    Returns (list of DER certs, error or None).  With stop_after_cert we hang up
+    as soon as the certificate is in: that is all we came for."""
     incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
-    ctx = unsafe_context(allow_tls13)
     try:
-        tls = ctx.wrap_bio(incoming, outgoing, server_hostname=host)
-    except Exception as e:      # e.g. IDNA problem with server_hostname
+        tls = ctx.wrap_bio(incoming, outgoing, server_hostname=sni)
+    except Exception as e:      # e.g. IDNA problem with the name
         return [], e
     raw = bytearray()
+    certs = []
     err = None
     while True:
         done = False
@@ -314,26 +553,31 @@ def tls_probe(sock, host, allow_tls13):
         out = outgoing.read()
         if out:
             try:
-                sock.sendall(out)
-            except OSError as e:
-                err = err or e
-                done = True
+                transport.send(out)     # our flight, or the alert when it failed
+            except Exception as e:
+                if not done:
+                    err, done = e, True
         if done:
             break
         try:
-            chunk = sock.recv(16384)
-        except OSError as e:
+            chunk = transport.recv()
+        except Exception as e:
             err = e
             break
         if not chunk:
             incoming.write_eof()
-            err = err or ssl.SSLError("server closed the connection during the handshake")
+            err = ssl.SSLError("the peer closed the connection during the handshake")
             break
         raw += chunk
         incoming.write(chunk)
-    certs = extract_certificates(bytes(raw))    # TLS<=1.2: cleartext Certificate
+        if stop_after_cert:
+            certs = extract_certificates(bytes(raw))
+            if certs:
+                break
     if not certs:
-        certs = peer_chain(tls)                 # TLS1.3 / encrypted handshake
+        certs = extract_certificates(bytes(raw))    # TLS<=1.2: cleartext Certificate
+    if not certs:
+        certs = peer_chain(tls)                     # TLS1.3 / encrypted handshake
     return certs, err
 
 
@@ -400,8 +644,9 @@ def clean_error(e):
     return "%s: %s" % (e.__class__.__name__, msg) if msg else e.__class__.__name__
 
 
-def describe(host, certs, now):
-    """Detail lines about a received (unverified) chain."""
+def describe(hostname, certs, now):
+    """Detail lines about a received (unverified) chain.  hostname=None (RADIUS
+    identity) means there is no name to check the certificate against."""
     out = []
     parsed = []
     for der in certs:
@@ -410,10 +655,10 @@ def describe(host, certs, now):
         except Exception as e:
             parsed.append(e)
     leaf = parsed[0] if parsed and isinstance(parsed[0], Cert) else None
-    if leaf:
-        match = leaf.matches(host)
+    if leaf and hostname:
+        match = leaf.matches(hostname)
         out.append("hostname %s: %s" % (
-            host, {True: "ok", False: "NO MATCH", None: "no name in cert"}[match]))
+            hostname, {True: "ok", False: "NO MATCH", None: "no name in cert"}[match]))
     out.append("chain received: %d certificate(s)" % len(certs))
     for i, c in enumerate(parsed, 1):
         if not isinstance(c, Cert):
@@ -439,36 +684,83 @@ def describe(host, certs, now):
     return out
 
 
-def test_cert(host, port):
+class TcpTarget(object):
+    """A host:port entry: implicit TLS, or STARTTLS on the ports we know."""
+
+    check_hostname = True
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.hostname = host            # the name the cert has to be valid for
+        self.sni = host
+
+    def open(self):
+        return TcpTransport(self.host, self.port)
+
+
+class RadiusTarget(object):
+    """An identity@realm:1812 entry: EAP-PEAP/TTLS tunnel through the RADIUS
+    proxy.  The identity is not a hostname, so only the chain is verified - a
+    RADIUS certificate is issued for the radius server's own name, which has
+    nothing to do with the realm."""
+
+    check_hostname = False
+    hostname = None
+    sni = None
+
+    def __init__(self, identity, port):
+        self.identity, self.port = identity, port
+
+    def open(self):
+        return RadiusTransport(self.identity, self.port)
+
+
+def make_target(host, port):
+    return RadiusTarget(host, port) if port==1812 else TcpTarget(host, port)
+
+
+def test_cert(target):
     """Returns (days left or None, summary line, detail lines)."""
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # 1. the normal, fully verified connection
+    # 1. the normal, fully verified handshake
     try:
-        sock = connect(host, port)
+        transport = target.open()
     except Exception as e:
         return None, "CONNECT FAILED: %s" % clean_error(e), []
+    tunnel = getattr(transport, "method", "")       # EAP-PEAP / EAP-TTLS
     try:
-        with sock:
-            with ssl.create_default_context().wrap_socket(
-                    sock, server_hostname=host) as ssock:
-                cert = Cert(ssock.getpeercert(binary_form=True))
-        return cert.days_left(now), "%s  %s" % (fmt_time(cert.not_after), cert.issuer_name), []
+        ctx = ssl.create_default_context()
+        if not target.check_hostname:
+            ctx.check_hostname = False
+        certs, err = tls_probe(transport, ctx, target.sni)
+        if err is not None:
+            raise err
+        if not certs:
+            raise RuntimeError("no certificate received")
+        cert = Cert(certs[0])
+        return (cert.days_left(now),
+                "%s  %s%s" % (fmt_time(cert.not_after), cert.issuer_name,
+                              "  [%s]" % tunnel if tunnel else ""), [])
     except Exception as e:
         verify_err = e
+    finally:
+        transport.close()
 
     # 2. it failed - look at the certificates without verifying anything
     certs, hs_err = [], None
     for allow_tls13 in (False, True):
         try:
-            sock = connect(host, port)
+            transport = target.open()
         except Exception as e:
             return None, "CONNECT FAILED: %s" % clean_error(e), []
         try:
-            with sock:
-                certs, hs_err = tls_probe(sock, host, allow_tls13)
+            certs, hs_err = tls_probe(transport, unsafe_context(allow_tls13),
+                                      target.sni, stop_after_cert=True)
         except Exception as e:
             hs_err = e
+        finally:
+            transport.close()
         if certs:
             break
 
@@ -479,7 +771,9 @@ def test_cert(host, port):
             detail.append("unverified handshake also failed: %s" % clean_error(hs_err))
         return None, summary, detail
 
-    detail = describe(host, certs, now)
+    detail = describe(target.hostname, certs, now)
+    if tunnel:
+        detail.insert(0, "tunnel: %s" % tunnel)
     if hs_err is not None:
         detail.append("(the unverified handshake did not complete either: %s)"
                       % clean_error(hs_err))
@@ -500,20 +794,28 @@ for line in open(HOSTLIST, "rt"):
     if not i:
         continue                # skip empty lines / comments
     host, port = i.rsplit(":", 1)
-    d, e, detail = test_cert(host, int(port))
+    d, e, detail = test_cert(make_target(host, int(port)))
     data.append((d, e, host, port, detail))
 
 # unknown (no certificate at all) first, then by days left
 data.sort(key=lambda x: (x[0] is not None, x[0] if x[0] is not None else 0, x[2]))
 
-reply = "From: %s\nSubject: cert-watcher status\n\n" % MAIL_FROM
+reply = ""
 for d, e, host, port, detail in data:
     reply += ("%4s  %s:%s " % ("?" if d is None else d, host, port)).ljust(32) + str(e) + "\n"
     for line in detail:
         reply += " " * 8 + line + "\n"
 
+header = "From: %s\nSubject: cert-watcher status\n" % MAIL_FROM
+# A certificate subject/issuer may well be non-ASCII (accented organization
+# names), so the mail is sent as UTF-8 - the old us-ascii encoding silently
+# dropped those characters.
+mime = ("MIME-Version: 1.0\n"
+        "Content-Type: text/plain; charset=utf-8\n"
+        "Content-Transfer-Encoding: 8bit\n")
+
 if len(sys.argv) > 1:
     subprocess.run(["/usr/sbin/sendmail"] + sys.argv[1:],
-                   input=reply.encode("us-ascii", errors="ignore"))
+                   input=(header + mime + "\n" + reply).encode("utf-8"))
 else:
-    print(reply)
+    print(header + "\n" + reply)
