@@ -571,7 +571,7 @@ def tls_probe(transport, ctx, sni, stop_after_cert=False):
         raw += chunk
         incoming.write(chunk)
         if stop_after_cert:
-            certs = extract_certificates(bytes(raw))
+            certs = extract_certificates(bytes(raw), need_complete=True)
             if certs:
                 break
     if not certs:
@@ -581,8 +581,12 @@ def tls_probe(transport, ctx, sni, stop_after_cert=False):
     return certs, err
 
 
-def extract_certificates(stream):
-    """Pull the Certificate chain out of a captured cleartext handshake."""
+def extract_certificates(stream, need_complete=False):
+    """Pull the Certificate chain out of a captured cleartext handshake.
+
+    need_complete=True returns nothing while the Certificate message is still
+    arriving: the caller uses it to decide when it may hang up, and a half read
+    message would give it a chain that is short by a certificate or two."""
     body = bytearray()
     pos = 0
     while pos + 5 <= len(stream):
@@ -597,15 +601,20 @@ def extract_certificates(stream):
     while pos + 4 <= len(body):
         htype = body[pos]
         hlen = int.from_bytes(body[pos + 1:pos + 4], "big")
+        truncated = pos + 4 + hlen > len(body)
         hbody = bytes(body[pos + 4:pos + 4 + hlen])
         pos += 4 + hlen
         if htype != 0x0B or len(hbody) < 3:     # Certificate
             continue
+        if truncated and need_complete:
+            return certs                        # the rest is still on its way
         end = min(3 + int.from_bytes(hbody[0:3], "big"), len(hbody))
         cpos = 3
         while cpos + 3 <= end:
             clen = int.from_bytes(hbody[cpos:cpos + 3], "big")
             cpos += 3
+            if cpos + clen > end:               # half arrived certificate
+                break
             certs.append(hbody[cpos:cpos + clen])
             cpos += clen
     return [c for c in certs if c]
