@@ -1,8 +1,18 @@
 #! /usr/bin/python3
 """certwatch - SSL/TLS certificate expiry watcher.
 
-Connects to the host:port pairs listed in certwatch.txt and reports how many
-days are left until the certificate expires.
+Connects to the services listed in certwatch.txt and reports how many days are
+left until the certificate expires.  A list entry is either a URI, where the
+port is optional, or the classic host:port pair:
+
+    https://www.example.hu          smtp://mail.example.hu:2525
+    imap://mail.example.hu          ftp://files.example.hu:1337
+    radius://eduroam@example.hu     www.example.hu:443
+
+With a protocol:// the protocol - and with it the STARTTLS dialogue - is known
+even on an unusual port.  Without it the port decides, the way this script
+always did (25/587 smtp, 143 imap, 21 ftp, 1812 radius, ...), and a port we do
+not know (or a bare host name: 443) means plain implicit TLS.
 
 A plain verified connection only tells us something when OpenSSL is happy with
 the whole chain: known CA, intermediate present, not expired yet, hostname
@@ -14,7 +24,7 @@ print the received chain in detail.  The days-left value then comes from the
 unverified leaf, so an already expired certificate still gets a real (negative)
 day count instead of a useless error.
 
-RADIUS realms are handled as well: an "eduroam@edu-realm.com:1812" style entry
+RADIUS realms are handled as well: a "radius://eduroam@edu-realm.com" entry
 means the TLS handshake is carried inside EAP-PEAP / EAP-TTLS over RADIUS, to
 the proxy configured below.  Only the outer tunnel is done - no inner
 authentication, no password: we wait for the server certificate and then drop
@@ -52,6 +62,35 @@ RADIUS_SECRET = "testing123"
 RADIUS_NAS_ID = "certwatch"
 RADIUS_CALLING_STATION = "02-00-00-00-00-01"    # some policies want a MAC
 RADIUS_RETRIES = 2                      # UDP: how many times a request is resent
+
+# Known protocols: name -> (default port, how the TLS starts).  None means
+# implicit TLS right after connect; "smtp"/"imap"/"pop3"/"ftp" is a STARTTLS
+# dialogue; "radius" is the EAP-PEAP/TTLS tunnel.  A host list entry may name
+# the protocol (smtp://mail.example.hu:2525), and then the port is optional.
+PROTOCOLS = {
+    "https":       (443, None),
+    "tls":         (443, None),     # anything speaking TLS straight away
+    "smtps":       (465, None),
+    "submissions": (465, None),
+    "imaps":       (993, None),
+    "pop3s":       (995, None),
+    "ldaps":       (636, None),
+    "ftps":        (990, None),     # implicit ftps
+    "smtp":        (25, "smtp"),
+    "submission":  (587, "smtp"),
+    "imap":        (143, "imap"),
+    "pop3":        (110, "pop3"),
+    "ftp":         (21, "ftp"),     # auth tls
+    "radius":      (1812, "radius"),
+}
+
+# Entries without a protocol:// are recognized by their port, the way this
+# script always did.  A port that is not here means plain implicit TLS.
+PORT_PROTOCOLS = {
+    21: "ftp", 25: "smtp", 110: "pop3", 143: "imap", 443: "https",
+    465: "smtps", 587: "submission", 636: "ldaps", 990: "ftps",
+    993: "imaps", 995: "pop3s", 1812: "radius",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +285,8 @@ class Cert(object):
 
 
 def fmt_time(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%SZ")
+    # UTC, but without the trailing Z: this is a report to read, not a data feed
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +296,7 @@ def fmt_time(dt):
 # send(bytes) and recv() -> bytes.
 # ---------------------------------------------------------------------------
 
-def connect(host, port):
+def connect(host, port, starttls=None):
     """Connected socket, ready for the TLS handshake (STARTTLS already done)."""
     sock = socket.create_connection((host, port), TIMEOUT)
     try:
@@ -269,12 +309,14 @@ def connect(host, port):
             sock.sendall(s)     # send cmd
             get()               # read reply
 
-        if port in (25, 587):   # smtp starttls
+        if starttls == "smtp":
             send(("EHLO %s\r\n" % EHLO_NAME).encode())
             send(b"STARTTLS\r\n", False)
-        elif port == 143:       # imap starttls
+        elif starttls == "imap":
             send(b"1 STARTTLS\r\n")
-        elif port == 21:        # ftp starttls
+        elif starttls == "pop3":
+            send(b"STLS\r\n")
+        elif starttls == "ftp":
             send(b"AUTH TLS\r\n")
     except Exception:
         sock.close()
@@ -285,8 +327,8 @@ def connect(host, port):
 class TcpTransport(object):
     """TLS records over a plain TCP connection."""
 
-    def __init__(self, host, port):
-        self.sock = connect(host, port)
+    def __init__(self, host, port, starttls=None):
+        self.sock = connect(host, port, starttls)
 
     def send(self, data):
         self.sock.sendall(data)
@@ -694,38 +736,74 @@ def describe(hostname, certs, now):
 
 
 class TcpTarget(object):
-    """A host:port entry: implicit TLS, or STARTTLS on the ports we know."""
+    """Anything reached over TCP: implicit TLS, or one of the STARTTLS
+    dialogues."""
 
     check_hostname = True
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, starttls, label):
         self.host, self.port = host, port
+        self.starttls = starttls
+        self.label = label
         self.hostname = host            # the name the cert has to be valid for
         self.sni = host
 
     def open(self):
-        return TcpTransport(self.host, self.port)
+        return TcpTransport(self.host, self.port, self.starttls)
 
 
 class RadiusTarget(object):
-    """An identity@realm:1812 entry: EAP-PEAP/TTLS tunnel through the RADIUS
-    proxy.  The identity is not a hostname, so only the chain is verified - a
-    RADIUS certificate is issued for the radius server's own name, which has
-    nothing to do with the realm."""
+    """radius://identity@realm - EAP-PEAP/TTLS tunnel through the RADIUS proxy.
+    The identity is not a hostname, so only the chain is verified: a RADIUS
+    certificate is issued for the radius server's own name, which has nothing
+    to do with the realm."""
 
     check_hostname = False
     hostname = None
     sni = None
 
-    def __init__(self, identity, port):
+    def __init__(self, identity, port, label):
         self.identity, self.port = identity, port
+        self.label = label
 
     def open(self):
         return RadiusTransport(self.identity, self.port)
 
 
-def make_target(host, port):
-    return RadiusTarget(host, port) if port==1812 else TcpTarget(host, port)
+def parse_entry(entry):
+    """One line of the host list -> a target.  Accepted forms:
+
+        proto://host[:port]     https://www.example.hu, smtp://mail.example.hu:2525
+        proto://identity@realm  radius://eduroam@uni-obuda.hu
+        host:port               the classic form: the port names the protocol
+        host                    plain TLS on 443
+
+    With an explicit protocol the port is optional (the protocol's own default
+    is used), so services on unusual ports can be checked as well."""
+    rest = entry
+    proto = None
+    if "://" in rest:
+        proto, rest = rest.split("://", 1)
+        proto = proto.lower()
+        if proto not in PROTOCOLS:
+            raise ValueError("unknown protocol: %s://" % proto)
+    rest = rest.split("/", 1)[0]        # a trailing path/slash is fine too
+    port = None
+    if ":" in rest:
+        rest, p = rest.rsplit(":", 1)
+        if not p.isdigit():
+            raise ValueError("bad port: %s" % p)
+        port = int(p)
+    if not rest:
+        raise ValueError("no host name")
+    if proto is None:                   # no protocol given: the port decides
+        proto = PORT_PROTOCOLS.get(port, "https")
+    default_port, starttls = PROTOCOLS[proto]
+    if port is None:
+        port = default_port
+    if starttls == "radius":
+        return RadiusTarget(rest, port, entry)
+    return TcpTarget(rest, port, starttls, entry)
 
 
 def test_cert(target):
@@ -802,16 +880,23 @@ for line in open(HOSTLIST, "rt"):
     i = line.split("#")[0].strip()
     if not i:
         continue                # skip empty lines / comments
-    host, port = i.rsplit(":", 1)
-    d, e, detail = test_cert(make_target(host, int(port)))
-    data.append((d, e, host, port, detail))
+    try:
+        target = parse_entry(i)
+    except ValueError as e:
+        data.append((None, "BAD ENTRY: %s" % e, i, []))
+        continue
+    d, e, detail = test_cert(target)
+    data.append((d, e, target.label, detail))
 
 # unknown (no certificate at all) first, then by days left
 data.sort(key=lambda x: (x[0] is not None, x[0] if x[0] is not None else 0, x[2]))
 
+# the second column is as wide as the longest entry, so the report lines up
+width = max([len(label) for d, e, label, detail in data] + [20])
+
 reply = ""
-for d, e, host, port, detail in data:
-    reply += ("%4s  %s:%s " % ("?" if d is None else d, host, port)).ljust(32) + str(e) + "\n"
+for d, e, label, detail in data:
+    reply += "%4s  %-*s  %s\n" % ("?" if d is None else d, width, label, e)
     for line in detail:
         reply += " " * 8 + line + "\n"
 

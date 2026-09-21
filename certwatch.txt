@@ -1,3 +1,18 @@
+# Entries: "protocol://host[:port]", or the classic "host:port".
+# With a protocol the port is optional, and the STARTTLS dialogue is right
+# even on an unusual port:  smtp://mail.example.hu:2525
+
+# web
+#https://www.example.hu
+
+# mail
+#smtp://mail.example.hu
+#submission://mail.example.hu
+#imap://mail.example.hu
+
+# radius realms: EAP-PEAP/TTLS through the proxy configured in certwatch.py
+#radius://eduroam@example.hu
+
 # test cases (badssl.com) - remove these on the real server
 badssl.com:443                  # valid, verified path
 expired.badssl.com:443          # expired -> negative day count from the unverified leaf

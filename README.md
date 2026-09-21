@@ -4,11 +4,27 @@ Queries SSL certificate of listed sites, prints days left before expiry and the 
 
 
 Supported protocols:
-- any implicit ssl protocols (https, imaps, smtps etc)
-- smtp starttls (25/587)
+- any implicit ssl protocols (https, imaps, smtps, pop3s, ldaps, ftps etc)
+- smtp starttls (smtp 25, submission 587)
 - imap starttls (143)
+- pop3 stls (110)
 - ftp auth tls (21)
 - radius EAP-PEAP / EAP-TTLS (1812)
+
+
+A list entry is either a URI or the classic `host:port` pair:
+
+    https://www.example.hu          smtp://mail.example.hu:2525
+    imap://mail.example.hu          ftp://files.example.hu:1337
+    radius://eduroam@example.hu     www.example.hu:443
+
+With an explicit `protocol://` the port is optional (the protocol's standard
+port is used), and - more importantly - the protocol, so the right STARTTLS
+dialogue is used even on an unusual port. Without a protocol the port decides,
+the way it always did (25/587 smtp, 143 imap, 110 pop3, 21 ftp, 1812 radius,
+...); a port that is not in the table, or a bare host name (443), means plain
+implicit TLS. A line that cannot be parsed is reported as `BAD ENTRY` instead
+of killing the run.
 
 
 If the normal (verified) connection fails - expired certificate, private or
@@ -22,7 +38,7 @@ expired certificate still gets a real (negative) day count and sorts to the top
 of the report.
 
 
-RADIUS entries look like `identity@my-realm.com:1812`: the left side is the EAP
+RADIUS entries look like `radius://identity@my-realm.com`: the left side is the EAP
 outer identity (it does not have to be a real user - the server sends its
 certificate during the TLS handshake, before any password is checked!),
 and all such queries go to the proxy configured at the top of certwatch.py
