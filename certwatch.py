@@ -81,16 +81,22 @@ PROTOCOLS = {
     "imap":        (143, "imap"),
     "pop3":        (110, "pop3"),
     "ftp":         (21, "ftp"),     # auth tls
+    "ldap":        (389, "ldap"),   # starttls extended operation
     "radius":      (1812, "radius"),
 }
 
 # Entries without a protocol:// are recognized by their port, the way this
 # script always did.  A port that is not here means plain implicit TLS.
 PORT_PROTOCOLS = {
-    21: "ftp", 25: "smtp", 110: "pop3", 143: "imap", 443: "https",
-    465: "smtps", 587: "submission", 636: "ldaps", 990: "ftps",
-    993: "imaps", 995: "pop3s", 1812: "radius",
+    21: "ftp", 25: "smtp", 110: "pop3", 143: "imap", 389: "ldap",
+    443: "https", 465: "smtps", 587: "submission", 636: "ldaps",
+    990: "ftps", 993: "imaps", 995: "pop3s", 1812: "radius",
 }
+
+# LDAP StartTLS (RFC 4511): an ExtendedRequest with the OID 1.3.6.1.4.1.1466.20037.
+# BER by hand: SEQUENCE { INTEGER messageID=1, [APPLICATION 23] { [0] oid } }
+LDAP_STARTTLS = (b"\x30\x1d\x02\x01\x01\x77\x18\x80\x16"
+                 b"1.3.6.1.4.1.1466.20037")
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +324,8 @@ def connect(host, port, starttls=None):
             send(b"STLS\r\n")
         elif starttls == "ftp":
             send(b"AUTH TLS\r\n")
+        elif starttls == "ldap":
+            send(LDAP_STARTTLS, False)      # ldap has no greeting to read first
     except Exception:
         sock.close()
         raise

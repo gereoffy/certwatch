@@ -9,6 +9,7 @@ Supported protocols:
 - imap starttls (143)
 - pop3 stls (110)
 - ftp auth tls (21)
+- ldap starttls (389)
 - radius EAP-PEAP / EAP-TTLS (1812)
 
 
@@ -16,15 +17,16 @@ A list entry is either a URI or the classic `host:port` pair:
 
     https://www.example.hu          smtp://mail.example.hu:2525
     imap://mail.example.hu          ftp://files.example.hu:1337
-    radius://eduroam@example.hu     www.example.hu:443
+    ldap://dc.example.local         radius://eduroam@example.hu
+    www.example.hu:443
 
 With an explicit `protocol://` the port is optional (the protocol's standard
 port is used), and - more importantly - the protocol, so the right STARTTLS
 dialogue is used even on an unusual port. Without a protocol the port decides,
-the way it always did (25/587 smtp, 143 imap, 110 pop3, 21 ftp, 1812 radius,
-...); a port that is not in the table, or a bare host name (443), means plain
-implicit TLS. A line that cannot be parsed is reported as `BAD ENTRY` instead
-of killing the run.
+the way it always did (25/587 smtp, 143 imap, 110 pop3, 21 ftp, 389 ldap,
+1812 radius, ...); a port that is not in the table, or a bare host name (443),
+means plain implicit TLS. A line that cannot be parsed is reported as
+`BAD ENTRY` instead of killing the run.
 
 
 If the normal (verified) connection fails - expired certificate, private or
