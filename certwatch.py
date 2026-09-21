@@ -302,30 +302,93 @@ def fmt_time(dt):
 # send(bytes) and recv() -> bytes.
 # ---------------------------------------------------------------------------
 
+class TlsSetupError(RuntimeError):
+    """The connection stands, but TLS could not be started on it: the server
+    refused the STARTTLS command, or the RADIUS/EAP tunnel never got going."""
+
+
+# What the server's reply to the STARTTLS command must contain.  (LDAP is not a
+# text protocol, its answer is checked by ldap_result().)
+STARTTLS_OK = {
+    "smtp": "220",          # 220 ready to start tls
+    "imap": "1 OK",         # "1" is the tag we send the command with
+    "pop3": "+OK",
+    "ftp":  "234",          # 234 auth tls ok
+}
+
+LDAP_RESULT_CODES = {
+    0: "success", 1: "operationsError", 2: "protocolError",
+    50: "insufficientAccessRights", 51: "busy", 52: "unavailable",
+    53: "unwillingToPerform", 80: "other",
+}
+
+
+def ldap_result(reply):
+    """(resultCode, diagnostic message) of an LDAP ExtendedResponse."""
+    try:
+        _, body, _ = _tlv(reply, 0)             # LDAPMessage SEQUENCE
+        parts = _children(body)                 # messageID, protocolOp
+        fields = _children(parts[1][1])         # resultCode, matchedDN, message
+        code = int.from_bytes(fields[0][1], "big")
+        msg = fields[2][1].decode("utf-8", "replace") if len(fields) > 2 else ""
+        return code, msg.strip()
+    except Exception:
+        return -1, "unparseable LDAP response"
+
+
+def check_starttls(proto, reply):
+    """Say why TLS will not start, in the server's own words.  Without this we
+    would only see a mystery 'connection reset' during the handshake."""
+    if not reply:
+        raise TlsSetupError("%s: the server closed the connection at STARTTLS" % proto)
+    if proto == "ldap":
+        code, msg = ldap_result(reply)
+        if code == 0:
+            return
+        raise TlsSetupError("LDAP StartTLS refused (resultCode %d: %s)%s"
+                            % (code, LDAP_RESULT_CODES.get(code, "?"),
+                               ": " + msg if msg else ""))
+    lines = [l for l in reply.decode("utf-8", "replace").splitlines() if l.strip()]
+    want = STARTTLS_OK[proto].upper()
+    for line in lines:
+        if line.upper().startswith(want):
+            return
+    raise TlsSetupError("%s STARTTLS refused: %s"
+                        % (proto.upper(), lines[0] if lines else "(empty reply)"))
+
+
 def connect(host, port, starttls=None):
     """Connected socket, ready for the TLS handshake (STARTTLS already done)."""
     sock = socket.create_connection((host, port), TIMEOUT)
     try:
-        def get():
-            return sock.recv(1024)
+        def get(text=True):
+            data = sock.recv(1024)
+            # a reply can arrive split; the text protocols end theirs with a newline
+            while text and data and not data.endswith(b"\n"):
+                more = sock.recv(1024)
+                if not more:
+                    break
+                data += more
+            return data
 
-        def send(s, welc=True):
+        def send(s, welc=True, text=True):
             if welc:
-                get()           # read welcome msg
-            sock.sendall(s)     # send cmd
-            get()               # read reply
+                get()               # read welcome msg
+            sock.sendall(s)         # send cmd
+            return get(text)        # read reply
 
         if starttls == "smtp":
             send(("EHLO %s\r\n" % EHLO_NAME).encode())
-            send(b"STARTTLS\r\n", False)
+            check_starttls("smtp", send(b"STARTTLS\r\n", False))
         elif starttls == "imap":
-            send(b"1 STARTTLS\r\n")
+            check_starttls("imap", send(b"1 STARTTLS\r\n"))
         elif starttls == "pop3":
-            send(b"STLS\r\n")
+            check_starttls("pop3", send(b"STLS\r\n"))
         elif starttls == "ftp":
-            send(b"AUTH TLS\r\n")
+            check_starttls("ftp", send(b"AUTH TLS\r\n"))
         elif starttls == "ldap":
-            send(LDAP_STARTTLS, False)      # ldap has no greeting to read first
+            # ldap has no greeting to read first, and its reply is not text
+            check_starttls("ldap", send(LDAP_STARTTLS, False, text=False))
     except Exception:
         sock.close()
         raise
@@ -491,10 +554,10 @@ class RadiusTransport(object):
             if state is not None:
                 self.state = state
             if code == ACCESS_REJECT:
-                raise RuntimeError("RADIUS Access-Reject%s" % reply_message(attrs))
+                raise TlsSetupError("RADIUS Access-Reject%s" % reply_message(attrs))
             if code != ACCESS_CHALLENGE:
-                raise RuntimeError("unexpected RADIUS reply code %d%s"
-                                   % (code, reply_message(attrs)))
+                raise TlsSetupError("unexpected RADIUS reply code %d%s"
+                                    % (code, reply_message(attrs)))
             self.attrs = attrs
             return attrs
         raise socket.timeout("no reply from the RADIUS server %s" % RADIUS_SERVER)
@@ -509,14 +572,14 @@ class RadiusTransport(object):
                 raise RuntimeError("no EAP-Message in the RADIUS reply")
             code, self.eap_id, etype, _, _ = parse_eap(eap)
             if code == EAP_FAILURE:
-                raise RuntimeError("EAP-Failure during the outer negotiation")
+                raise TlsSetupError("EAP-Failure during the outer negotiation")
             if etype in TUNNEL_TYPES:
                 self.eap_type = etype
                 self.method = TUNNEL_TYPES[etype]
                 return
             attrs = self._exchange(eap_nak(self.eap_id, wanted.pop(0)))
-        raise RuntimeError("the server offers no EAP tunnel type (PEAP/TTLS) "
-                           "for this identity")
+        raise TlsSetupError("the server offers no EAP tunnel type (PEAP/TTLS) "
+                            "for this identity")
 
     def send(self, data):
         # No outgoing fragmentation: our flights fit in one RADIUS packet (we
@@ -698,8 +761,8 @@ def clean_error(e):
     """Shortest useful form of an exception."""
     msg = re.sub(r"\s*\(_ssl\.c:\d+\)", "",
                  getattr(e, "verify_message", None) or str(e)).strip()
-    if isinstance(e, (ssl.SSLError, OSError)):      # these speak for themselves
-        return msg or e.__class__.__name__
+    if isinstance(e, (ssl.SSLError, OSError, TlsSetupError)):
+        return msg or e.__class__.__name__          # these speak for themselves
     return "%s: %s" % (e.__class__.__name__, msg) if msg else e.__class__.__name__
 
 
@@ -821,6 +884,8 @@ def test_cert(target):
     # 1. the normal, fully verified handshake
     try:
         transport = target.open()
+    except TlsSetupError as e:
+        return None, "TLS FAILED: %s" % clean_error(e), []
     except Exception as e:
         return None, "CONNECT FAILED: %s" % clean_error(e), []
     tunnel = getattr(transport, "method", "")       # EAP-PEAP / EAP-TTLS
@@ -847,6 +912,8 @@ def test_cert(target):
     for allow_tls13 in (False, True):
         try:
             transport = target.open()
+        except TlsSetupError as e:
+            return None, "TLS FAILED: %s" % clean_error(e), []
         except Exception as e:
             return None, "CONNECT FAILED: %s" % clean_error(e), []
         try:
@@ -859,13 +926,15 @@ def test_cert(target):
         if certs:
             break
 
-    summary = "UNVERIFIED: %s" % clean_error(verify_err)
     if not certs:
-        detail = ["could not get any certificate from the server"]
-        if hs_err is not None:
-            detail.append("unverified handshake also failed: %s" % clean_error(hs_err))
-        return None, summary, detail
+        # We never got to see a certificate, so this is not a verification
+        # problem: report what actually went wrong instead.
+        detail = []
+        if hs_err is not None and clean_error(hs_err) != clean_error(verify_err):
+            detail.append("the unverified retry failed too: %s" % clean_error(hs_err))
+        return None, "TLS FAILED: %s" % clean_error(verify_err), detail
 
+    summary = "UNVERIFIED: %s" % clean_error(verify_err)
     detail = describe(target.hostname, certs, now)
     if tunnel:
         detail.insert(0, "tunnel: %s" % tunnel)
